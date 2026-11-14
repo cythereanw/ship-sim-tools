@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>舰船积木 · 离线搭建</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { background:#0b1220; color:#e2e8f0; font:14px/1.4 -apple-system,'PingFang SC',sans-serif;
+         height:100vh; display:flex; flex-direction:column; overflow:hidden; touch-action:none; }
+  header { padding:8px 12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; background:#101a2c; border-bottom:1px solid #1e293b; }
+  header b { color:#4dd0e1; }
+  .sw { width:34px; height:34px; border-radius:8px; border:2px solid transparent; cursor:pointer; }
+  .sw.on { border-color:#fff; box-shadow:0 0 0 2px #4dd0e1; }
+  .btn { background:#1e293b; color:#e2e8f0; border:1px solid #475569; border-radius:8px; padding:6px 12px; font-size:13px; }
+  .btn.on { background:#4dd0e1; color:#0b1220; font-weight:600; }
+  .btn.warn { border-color:#b45309; color:#fbbf24; }
+  #count { color:#94a3b8; font-size:12px; margin-left:auto; }
+  main { flex:1; position:relative; }
+  svg { width:100%; height:100%; display:block; touch-action:none; }
+  footer { padding:6px 12px 10px; background:#101a2c; border-top:1px solid #1e293b; font-size:11px; color:#64748b; }
+  #tip { position:absolute; top:8px; left:12px; font-size:12px; color:#94a3b8; pointer-events:none;
+         background:rgba(15,23,42,.7); padding:4px 10px; border-radius:8px; }
+</style>
+</head>
+<body>
+<header>
+  <b>积木</b>
+  <div id="palette" style="display:flex;gap:6px"></div>
+  <button class="btn" id="eraser">🧽 擦除</button>
+  <button class="btn" id="undo">↩ 撤销</button>
+  <button class="btn warn" id="clear">清空</button>
+  <button class="btn" id="export">⬇ 导出</button>
+  <button class="btn" id="import">⬆ 导入</button>
+  <span id="count">0 块</span>
+</header>
+<main>
+  <div id="tip">单指拖动旋转 · 点面放方块 · 擦除模式点方块删除</div>
+  <svg id="view"></svg>
+</main>
+<footer>颜色仅作分类标识（无参数/算法）· 导出 JSON 存「文件」App，回电脑交给 agent 转正式画布 · 自动保存到本机</footer>
+<script>
+(function () {
+  /* ---- 状态 ---- */
+  var COLORS = [
+    { n:'结构', c:'#5b6b7c' }, { n:'浮仓', c:'#4dd0e1' }, { n:'装甲', c:'#e3c98d' },
+    { n:'炮塔', c:'#e0913f' }, { n:'舰桥', c:'#b39cf5' }, { n:'锅炉', c:'#d9534f' }, { n:'舵机', c:'#8e7cc3' }
+  ];
+  var GRID = [24, 8, 7];            /* 长×宽×高（格） */
+  var LEVEL_H = 0.55;               /* 与正式模型同口径的层高视觉比 */
+  var blocks = {};                  /* 'x,y,z' -> colorIdx */
+  var undoStack = [];
+  var cur = 0, erase = false;
+  var yaw = -0.62, pitch = 0.52;    /* 30° 俯视 */
+  var LS = 'voxel_sketch_v1', lsOk = true;
+  try { var saved = JSON.parse(localStorage.getItem(LS) || 'null');
+        if (saved) { blocks = saved.blocks || {}; GRID = saved.grid || GRID; } } catch (e) {}
+  try { localStorage.setItem('__p','1'); localStorage.removeItem('__p'); } catch (e) { lsOk = false; }
+
+  var svg = document.getElementById('view'), NS = 'http://www.w3.org/2000/svg';
+  var countEl = document.getElementById('count'), tip = document.getElementById('tip');
+
+  /* ---- 几何：正交等距投影（与 ShipModelView 同思路） ---- */
+  var scale = 1, ox = 0, oy = 0;
+  function fit() {
+    var w = GRID[0], d = GRID[1], h = GRID[2] * LEVEL_H;
+    var sw = Math.abs(w * Math.cos(yaw)) + Math.abs(d * Math.sin(yaw));
+    var sd = Math.abs(w * Math.sin(yaw)) + Math.abs(d * Math.cos(yaw));
+    var sh = sd * Math.sin(pitch) + Math.max(0.6, h) * Math.cos(pitch);
+    var r = svg.getBoundingClientRect();
+    scale = Math.min((r.width - 24) / Math.max(1, sw), (r.height - 40) / Math.max(1, sh));
+    ox = r.width / 2; oy = r.height / 2;
+  }
+  function proj(x, y, z) {
+    var dx = x - GRID[0] / 2, dy = y - GRID[1] / 2, dz = z * LEVEL_H - GRID[2] * LEVEL_H / 2;
+    var c = Math.cos(yaw), s = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+    var rx = dx * c - dy * s, ry = dx * s + dy * c;
+    return { x: ox + rx * scale, y: oy + (ry * sp - dz * cp) * scale, depth: ry * cp + dz * sp };
+  }
+  var cam = function () {
+    return { x: Math.sin(yaw) * Math.sin(pitch), y: Math.cos(yaw) * Math.sin(pitch), z: Math.cos(pitch) };
+  };
+  function shade(hex, k) {
+    var n = parseInt(hex.slice(1), 16);
+    var f = function (v) { return Math.max(0, Math.min(255, Math.round(v * (1 + k)))); };
+    return 'rgb(' + f((n >> 16) & 255) + ',' + f((n >> 8) & 255) + ',' + f(n & 255) + ')';
+  }
+
+  /* ---- 渲染 ---- */
+  function render() {
+    fit();
+    var camv = cam();
+    /* 收集外露面 */
+    var has = function (x, y, z) { return blocks[x + ',' + y + ',' + z] !== undefined; };
+    var faces = [];
+    for (var k in blocks) {
+      var p = k.split(','), x = +p[0], y = +p[1], z = +p[2], c = COLORS[blocks[k]].c;
+      var z0 = z * LEVEL_H, z1 = z0 + LEVEL_H;
+      function push(fk, pts) { faces.push({ k: fk, x: x, y: y, z: z, c: c, pts: pts }); }
+      if (!has(x, y, z + 1)) push('z+', [[x, y, z1], [x + 1, y, z1], [x + 1, y + 1, z1], [x, y + 1, z1]]);
+      if (!has(x, y, z - 1)) push('z-', [[x, y, z0], [x, y + 1, z0], [x + 1, y + 1, z0], [x + 1, y, z0]]);
+      if (!has(x + 1, y, z)) push('x+', [[x + 1, y, z0], [x + 1, y + 1, z0], [x + 1, y + 1, z1], [x + 1, y, z1]]);
+      if (!has(x - 1, y, z)) push('x-', [[x, y + 1, z0], [x, y, z0], [x, y, z1], [x, y + 1, z1]]);
+      if (!has(x, y + 1, z)) push('y+', [[x, y + 1, z0], [x + 1, y + 1, z0], [x + 1, y + 1, z1], [x, y + 1, z1]]);
+      if (!has(x, y - 1, z)) push('y-', [[x + 1, y, z0], [x, y, z0], [x, y, z1], [x + 1, y, z1]]);
+    }
+    var shaded = { 'z+': 0, 'z-': -0.45, 'x+': -0.18, 'x-': -0.26, 'y+': -0.34, 'y-': -0.40 };
+    var polys = [];
+    faces.forEach(function (f) {
+      if (f.k === 'x+' && camv.x <= 0) return;
+      if (f.k === 'x-' && camv.x >= 0) return;
+      if (f.k === 'y+' && camv.y <= 0) return;
+      if (f.k === 'y-' && camv.y >= 0) return;
+      if (f.k === 'z+' && camv.z <= 0) return;
+      if (f.k === 'z-' && camv.z >= 0) return;
+      var pts = f.pts.map(function (q) { return proj(q[0], q[1], q[2]); });
+      polys.push({
+        d: Math.max.apply(null, pts.map(function (p) { return p.depth; })),
+        str: pts.map(function (p) { return p.x.toFixed(1) + ',' + p.y.toFixed(1); }).join(' '),
+        fill: shade(f.c, shaded[f.k]), x: f.x, y: f.y, z: f.z, k: f.k
+      });
+    });
+    polys.sort(function (a, b) { return a.d - b.d; });
+    /* 网格基座 */
+    var s = '';
+    for (var i = 0; i <= GRID[0]; i++) {
+      var a = proj(i, 0, 0), b = proj(i, GRID[1], 0);
+      s += '<line x1="' + a.x + '" y1="' + a.y + '" x2="' + b.x + '" y2="' + b.y + '" stroke="#1e293b" stroke-width="0.6"/>';
+    }
+    for (var j = 0; j <= GRID[1]; j++) {
+      var a2 = proj(0, j, 0), b2 = proj(GRID[0], j, 0);
+      s += '<line x1="' + a2.x + '" y1="' + a2.y + '" x2="' + b2.x + '" y2="' + b2.y + '" stroke="#1e293b" stroke-width="0.6"/>';
+    }
+    polys.forEach(function (p, idx) {
+      s += '<polygon points="' + p.str + '" fill="' + p.fill + '" stroke="rgba(0,0,0,.3)" stroke-width="0.4"' +
+           ' data-x="' + p.x + '" data-y="' + p.y + '" data-z="' + p.z + '" data-k="' + p.k + '" data-i="' + idx + '"/>';
+    });
+    svg.innerHTML = s;
+    countEl.textContent = Object.keys(blocks).length + ' 块' + (lsOk ? '' : ' ⚠ 无法本地保存');
+  }
+
+  /* ---- 交互 ---- */
+  function place(x, y, z, c) {
+    if (x < 0 || y < 0 || z < 0 || x >= GRID[0] || y >= GRID[1] || z >= GRID[2]) return;
+    var k = x + ',' + y + ',' + z;
+    undoStack.push({ del: k in blocks, k: k, c: blocks[k] });
+    blocks[k] = c; persist(); render();
+  }
+  function removeAt(x, y, z) {
+    var k = x + ',' + y + ',' + z;
+    if (!(k in blocks)) return;
+    undoStack.push({ del: true, k: k, c: blocks[k] });
+    delete blocks[k]; persist(); render();
+  }
+  function persist() { try { localStorage.setItem(LS, JSON.stringify({ v: 1, grid: GRID, blocks: blocks })); } catch (e) {} }
+
+  var drag = null;
+  svg.addEventListener('pointerdown', function (e) {
+    drag = { x: e.clientX, y: e.clientY, yaw: yaw, moved: false, t: e.target };
+  });
+  svg.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    var dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 6) drag.moved = true;
+    if (drag.moved) { yaw = drag.yaw - dx * 0.012; render(); }
+  });
+  svg.addEventListener('pointerup', function (e) {
+    if (!drag) return;
+    if (!drag.moved && e.target.tagName === 'polygon' && e.target.dataset.x !== undefined) {
+      var x = +e.target.dataset.x, y = +e.target.dataset.y, z = +e.target.dataset.z, k = e.target.dataset.k;
+      if (erase) removeAt(x, y, z);
+      else {
+        var nx = x + (k === 'x+' ? 1 : k === 'x-' ? -1 : 0),
+            ny = y + (k === 'y+' ? 1 : k === 'y-' ? -1 : 0),
+            nz = z + (k === 'z+' ? 1 : k === 'z-' ? -1 : 0);
+        place(nx, ny, nz, cur);
+      }
+    }
+    drag = null;
+  });
+  svg.addEventListener('pointercancel', function () { drag = null; });
+
+  /* ---- 调色板 / 工具 ---- */
+  var pal = document.getElementById('palette');
+  COLORS.forEach(function (col, i) {
+    var b = document.createElement('button');
+    b.className = 'sw' + (i === 0 ? ' on' : '');
+    b.style.background = col.c; b.title = col.n;
+    b.onclick = function () {
+      cur = i; erase = false;
+      document.getElementById('eraser').classList.remove('on');
+      [].forEach.call(pal.children, function (el) { el.classList.remove('on'); });
+      b.classList.add('on');
+      tip.textContent = '点面放置「' + col.n + '」方块 · 单指拖动旋转';
+    };
+    pal.appendChild(b);
+  });
+  document.getElementById('eraser').onclick = function () {
+    erase = !erase;
+    this.classList.toggle('on', erase);
+    tip.textContent = erase ? '擦除模式：点方块删除' : '点面放置方块';
+  };
+  document.getElementById('undo').onclick = function () {
+    var op = undoStack.pop(); if (!op) return;
+    if (op.del) blocks[op.k] = op.c; else delete blocks[op.k];
+    persist(); render();
+  };
+  document.getElementById('clear').onclick = function () {
+    if (!confirm('清空全部方块？（撤销可恢复）')) return;
+    undoStack.push({ clear: true, snapshot: blocks }); blocks = {}; persist(); render();
+  };
+  document.getElementById('export').onclick = function () {
+    var arr = Object.keys(blocks).map(function (k) {
+      var p = k.split(','); return [+p[0], +p[1], +p[2], blocks[k]];
+    });
+    var blob = new Blob([JSON.stringify({ kind: 'voxel_sketch', v: 1, grid: GRID, colors: COLORS.map(function (c) { return c.n; }), blocks: arr })], { type: 'application/json' });
+    var a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'voxel-sketch-' + new Date().toISOString().slice(0, 10) + '.json'; a.click();
+  };
+  document.getElementById('import').onclick = function () {
+    var inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json';
+    inp.onchange = function () {
+      var f = inp.files[0]; if (!f) return;
+      var r = new FileReader();
+      r.onload = function () {
+        try {
+          var d = JSON.parse(r.result);
+          if (d.kind !== 'voxel_sketch' && !d.blocks) throw new Error('不是积木文件');
+          GRID = d.grid || GRID; undoStack.push({ clear: true, snapshot: blocks });
+          blocks = {}; (d.blocks || []).forEach(function (b) { blocks[b[0] + ',' + b[1] + ',' + b[2]] = b[3]; });
+          persist(); render();
+        } catch (e) { alert('导入失败：' + e); }
+      };
+      r.readAsText(f);
+    };
+    inp.click();
+  };
+
+  window.addEventListener('resize', render);
+  render();
+})();
+</script>
+</body>
+</html>
